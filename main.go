@@ -172,7 +172,7 @@ func initRootCommand() (*cobra.Command, *templateData, *cmdFlags) {
 	rootCmd.PersistentFlags().IntVarP(&flags.groupSize,
 		"groupSize",
 		"g",
-		20,
+		100,
 		"the number of tests per test group indicator")
 	rootCmd.PersistentFlags().StringVarP(&flags.outputFlag,
 		"output",
@@ -208,7 +208,7 @@ func readTestDataFromStdIn(stdinScanner *bufio.Scanner, flags *cmdFlags, cmd *co
 		}
 		goTestOutputRow := &goTestOutputRow{}
 		if err := json.Unmarshal(lineInput, goTestOutputRow); err != nil {
-			return nil, nil, err
+			continue
 		}
 		if goTestOutputRow.TestName != "" {
 			var status *testStatus

@@ -42,12 +42,13 @@ type (
 	}
 
 	cmdFlags struct {
-		titleFlag  string
-		sizeFlag   string
-		groupSize  int
-		outputFlag string
-		verbose    bool
-		append     bool
+		titleFlag     string
+		sizeFlag      string
+		groupSize     int
+		outputFlag    string
+		verbose       bool
+		append        bool
+		targetPackage string
 	}
 
 	goListJSONModule struct {
@@ -108,7 +109,10 @@ func initRootCommand() (*cobra.Command, *templateData, *cmdFlags) {
 				testReportHTMLTemplateFile *os.File
 				tpl                        *template.Template
 			)
-			tpl, _ = tmplData.initReportHTML()
+			tpl, err := tmplData.initReportHTML()
+			if err != nil {
+				return err
+			}
 			if flags.append && FileExist(tmplData.OutputFilename) {
 				testReportHTMLTemplateFile, _ = os.OpenFile(tmplData.OutputFilename, os.O_RDWR, 0)
 				err := tmplData.readDataFromHTML(testReportHTMLTemplateFile)
@@ -134,7 +138,7 @@ func initRootCommand() (*cobra.Command, *templateData, *cmdFlags) {
 			}
 			elapsedTestTime := time.Since(startTestTime)
 			// used to the location of test functions in test go files by package and test function name.
-			testFileDetailByPackage, err := getPackageDetails(allPackageNames)
+			testFileDetailByPackage, err := getPackageDetails(allPackageNames, flags.targetPackage)
 			if err != nil {
 				return err
 			}
@@ -189,6 +193,11 @@ func initRootCommand() (*cobra.Command, *templateData, *cmdFlags) {
 		"a",
 		false,
 		"append to the HTML output file")
+	rootCmd.PersistentFlags().StringVarP(&flags.targetPackage,
+		"package",
+		"p",
+		"",
+		"if run with a test file, point out the target package")
 
 	return rootCmd, tmplData, flags
 }
@@ -243,13 +252,17 @@ func readTestDataFromStdIn(stdinScanner *bufio.Scanner, flags *cmdFlags, cmd *co
 	return allPackageNames, allTests, nil
 }
 
-func getPackageDetails(allPackageNames map[string]*types.Nil) (testFileDetailsByPackage, error) {
+func getPackageDetails(allPackageNames map[string]*types.Nil, defaultPackage string) (testFileDetailsByPackage, error) {
 	var out bytes.Buffer
 	var cmd *exec.Cmd
 	testFileDetailByPackage := testFileDetailsByPackage{}
 	stringReader := strings.NewReader("")
 	for packageName := range allPackageNames {
-		cmd = exec.Command("go", "list", "-json", packageName)
+		if packageName == "command-line-arguments" {
+			cmd = exec.Command("go", "list", "-json", defaultPackage)
+		} else {
+			cmd = exec.Command("go", "list", "-json", packageName)
+		}
 		out.Reset()
 		stringReader.Reset("")
 		cmd.Stdin = stringReader

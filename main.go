@@ -3,10 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/spf13/cobra"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -18,6 +18,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 )
 
 type (
@@ -49,6 +52,7 @@ type (
 		verbose       bool
 		append        bool
 		targetPackage string
+		listFlag      string
 	}
 
 	goListJSONModule struct {
@@ -76,7 +80,8 @@ type (
 		TestFunctionFilePos testFunctionFilePos
 	}
 
-	testFileDetailsByPackage map[string]map[string]*testFileDetail
+	testFileDetailsByTest    map[string]*testFileDetail
+	testFileDetailsByPackage map[string]testFileDetailsByTest
 )
 
 func main() {
@@ -138,7 +143,12 @@ func initRootCommand() (*cobra.Command, *templateData, *cmdFlags) {
 			}
 			elapsedTestTime := time.Since(startTestTime)
 			// used to the location of test functions in test go files by package and test function name.
-			testFileDetailByPackage, err := getPackageDetails(allPackageNames, flags.targetPackage)
+			var testFileDetailByPackage testFileDetailsByPackage
+			if flags.listFlag != "" {
+				testFileDetailByPackage, err = getAllDetails(flags.listFlag)
+			} else {
+				testFileDetailByPackage, err = getPackageDetails(allPackageNames)
+			}
 			if err != nil {
 				return err
 			}
@@ -178,6 +188,11 @@ func initRootCommand() (*cobra.Command, *templateData, *cmdFlags) {
 		"g",
 		100,
 		"the number of tests per test group indicator")
+	rootCmd.PersistentFlags().StringVarP(&flags.listFlag,
+		"list",
+		"l",
+		"",
+		"the JSON module list")
 	rootCmd.PersistentFlags().StringVarP(&flags.outputFlag,
 		"output",
 		"o",
@@ -252,59 +267,115 @@ func readTestDataFromStdIn(stdinScanner *bufio.Scanner, flags *cmdFlags, cmd *co
 	return allPackageNames, allTests, nil
 }
 
-func getPackageDetails(allPackageNames map[string]*types.Nil, defaultPackage string) (testFileDetailsByPackage, error) {
-	var out bytes.Buffer
-	var cmd *exec.Cmd
+func getAllDetails(listFile string) (testFileDetailsByPackage, error) {
 	testFileDetailByPackage := testFileDetailsByPackage{}
-	stringReader := strings.NewReader("")
-	for packageName := range allPackageNames {
-		if packageName == "command-line-arguments" {
-			cmd = exec.Command("go", "list", "-json", defaultPackage)
-		} else {
-			cmd = exec.Command("go", "list", "-json", packageName)
+	f, err := os.Open(listFile)
+	defer f.Close()
+	if err != nil {
+		return nil, err
+	}
+	list := json.NewDecoder(f)
+	for list.More() {
+		goListJSON := goListJSON{}
+		if err := list.Decode(&goListJSON); err != nil {
+			return nil, err
 		}
-		out.Reset()
-		stringReader.Reset("")
-		cmd.Stdin = stringReader
-		cmd.Stdout = &out
-		err := cmd.Run()
+		packageName := goListJSON.ImportPath
+		testFileDetailsByTest, err := getFileDetails(&goListJSON)
 		if err != nil {
 			return nil, err
 		}
-		goListJSON := &goListJSON{}
-		if err := json.Unmarshal(out.Bytes(), goListJSON); err != nil {
-			return nil, err
-		}
-		testFileDetailByPackage[packageName] = map[string]*testFileDetail{}
-		for _, file := range goListJSON.TestGoFiles {
-			sourceFilePath := fmt.Sprintf("%s/%s", goListJSON.Dir, file)
-			fileSet := token.NewFileSet()
-			f, err := parser.ParseFile(fileSet, sourceFilePath, nil, 0)
-			if err != nil {
-				return nil, err
-			}
-			ast.Inspect(f, func(n ast.Node) bool {
-				switch x := n.(type) {
-				case *ast.FuncDecl:
-					testFileDetail := &testFileDetail{}
-					fileSetPos := fileSet.Position(n.Pos())
-					folders := strings.Split(fileSetPos.String(), "/")
-					fileNameWithPos := folders[len(folders)-1]
-					fileDetails := strings.Split(fileNameWithPos, ":")
-					lineNum, _ := strconv.Atoi(fileDetails[1])
-					colNum, _ := strconv.Atoi(fileDetails[2])
-					testFileDetail.FileName = fileDetails[0]
-					testFileDetail.TestFunctionFilePos = testFunctionFilePos{
-						Line: lineNum,
-						Col:  colNum,
-					}
-					testFileDetailByPackage[packageName][x.Name.Name] = testFileDetail
-				}
-				return true
-			})
-		}
+		testFileDetailByPackage[packageName] = testFileDetailsByTest
 	}
 	return testFileDetailByPackage, nil
+}
+
+func getPackageDetails(allPackageNames map[string]*types.Nil) (testFileDetailsByPackage, error) {
+	var testFileDetailByPackage testFileDetailsByPackage
+	ctx := context.Background()
+	g, ctx := errgroup.WithContext(ctx)
+	details := make(chan testFileDetailsByPackage)
+	for packageName := range allPackageNames {
+		name := packageName
+		g.Go(func() error {
+			testFileDetailsByTest, err := getTestDetails(name)
+			if err != nil {
+				return err
+			}
+			select {
+			case details <- testFileDetailsByPackage{name: testFileDetailsByTest}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+
+		})
+	}
+	go func() {
+		g.Wait()
+		close(details)
+	}()
+
+	testFileDetailByPackage = make(testFileDetailsByPackage, len(allPackageNames))
+	for d := range details {
+		for packageName, testFileDetailsByTest := range d {
+			testFileDetailByPackage[packageName] = testFileDetailsByTest
+		}
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return testFileDetailByPackage, nil
+}
+
+func getTestDetails(packageName string) (testFileDetailsByTest, error) {
+	var out bytes.Buffer
+	var cmd *exec.Cmd
+	stringReader := strings.NewReader("")
+	cmd = exec.Command("go", "list", "-json", packageName)
+	cmd.Stdin = stringReader
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return nil, err
+	}
+	goListJSON := &goListJSON{}
+	if err := json.Unmarshal(out.Bytes(), goListJSON); err != nil {
+		return nil, err
+	}
+	return getFileDetails(goListJSON)
+}
+
+func getFileDetails(goListJSON *goListJSON) (testFileDetailsByTest, error) {
+	testFileDetailByTest := map[string]*testFileDetail{}
+	for _, file := range goListJSON.TestGoFiles {
+		sourceFilePath := fmt.Sprintf("%s/%s", goListJSON.Dir, file)
+		fileSet := token.NewFileSet()
+		f, err := parser.ParseFile(fileSet, sourceFilePath, nil, 0)
+		if err != nil {
+			return nil, err
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.FuncDecl:
+				testFileDetail := &testFileDetail{}
+				fileSetPos := fileSet.Position(n.Pos())
+				folders := strings.Split(fileSetPos.String(), "/")
+				fileNameWithPos := folders[len(folders)-1]
+				fileDetails := strings.Split(fileNameWithPos, ":")
+				lineNum, _ := strconv.Atoi(fileDetails[1])
+				colNum, _ := strconv.Atoi(fileDetails[2])
+				testFileDetail.FileName = fileDetails[0]
+				testFileDetail.TestFunctionFilePos = testFunctionFilePos{
+					Line: lineNum,
+					Col:  colNum,
+				}
+				testFileDetailByTest[x.Name.Name] = testFileDetail
+			}
+			return true
+		})
+	}
+	return testFileDetailByTest, nil
 }
 
 type testRef struct {

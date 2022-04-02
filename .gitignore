@@ -6,3 +6,5 @@ embed_assets/embed_assets
 release_builds/
 .idea/
 .DS_Store
+package-lock.json
+go.sum
